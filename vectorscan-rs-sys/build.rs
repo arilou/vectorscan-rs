@@ -1,6 +1,14 @@
 use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use nix::{
+    errno, mount,
+    sched::{unshare, CloneFlags},
+    sys::wait,
+    unistd,
+};
 
 /// Get the environment variable with the given name, panicking if it is not set.
 fn env(name: &str) -> String {
@@ -20,6 +28,79 @@ fn rename_library(dst: &Path) {
     }
 }
 
+/// Bind mounts a directory in an unshared mount namespace
+///
+/// In order to do so, enters a user namespace if required not already root.
+///
+/// On success, this function returns but potentially from the context of a
+/// child process. The parent process will eventually exit with the same exit
+/// code as the child process, and never return.
+pub fn with_optional_bind_mount<F, R>(source: &Path, target: &Path, f: F) -> R
+where
+    F: FnOnce(&Path, &Path) -> R,
+{
+    // Get real uid & gid
+    let uid = unistd::getuid();
+    let gid = unistd::getgid();
+
+    // Unshare user & mount namespaces if possible, and if not, run the callback
+    // with the original source directory
+    if unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS).is_err() {
+        eprintln!("namespace unsharing unsupported or blocked");
+        return f(source, source);
+    }
+
+    // Remap own uid & gid
+    File::create("/proc/self/setgroups")
+        .expect("failed to create setgroups")
+        .write_all(b"deny")
+        .expect("Failed to deny setgroups");
+    File::create("/proc/self/uid_map")
+        .expect("failed to open uid_map")
+        .write_all(format!("{uid} {uid} 1").as_bytes())
+        .expect("failed to remap uid");
+    File::create("/proc/self/gid_map")
+        .expect("failed to open gid_map")
+        .write_all(format!("{gid} {gid} 1").as_bytes())
+        .expect("failed to remap gid");
+
+    // Fork and continue running from the child in order to get into the
+    // unshared process namespace
+    // This is unsafe to do in multi-threaded programs, but this code is run
+    // from the constructor so it's assured to be single-threaded.
+    unsafe {
+        if let unistd::ForkResult::Parent { child } = unistd::fork().expect("failed to fork") {
+            loop {
+                match wait::waitpid(child, None) {
+                    Ok(wait::WaitStatus::Exited(_pid, code)) => libc::_exit(code),
+                    Ok(_) | Err(errno::Errno::EINTR) => {}
+                    Err(e) => {
+                        eprintln!("waitpid returned {e:?}");
+                        libc::_exit(e as _);
+                    }
+                }
+            }
+        }
+    }
+
+    // Mount bind the source directory to the target directory
+    mount::mount(
+        Some(source),
+        target,
+        None::<&str>,
+        mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .expect("failed to bind mount {source} to {target}");
+
+    let ret = f(source, target);
+
+    // Clean up
+    mount::umount(target).expect("failed to unmount {target}");
+
+    ret
+}
+
 fn main() {
     // Note: use `rerun-if-changed=build.rs` to indicate that this build script *shouldn't* be
     // rerun: see https://doc.rust-lang.org/cargo/reference/build-scripts.html#change-detection
@@ -29,197 +110,212 @@ fn main() {
     let manifest_dir = PathBuf::from(env("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env("OUT_DIR"));
 
-    let include_dir = out_dir
-        .join("include")
-        .into_os_string()
-        .into_string()
-        .unwrap();
-
-    // Choose appropriate C++ runtime library
-    {
-        let compiler_version_out = String::from_utf8(
-            Command::new("c++")
-                .args(["-v"])
-                .output()
-                .expect("Failed to get C++ compiler version")
-                .stderr,
-        )
-        .unwrap();
-
-        if compiler_version_out.contains("gcc") {
-            println!("cargo:rustc-link-lib=stdc++");
-        } else if compiler_version_out.contains("clang") {
-            println!("cargo:rustc-link-lib=c++");
-        } else {
-            panic!("No compatible compiler found: either clang or gcc is needed");
-        }
-    }
-
-    const VERSION: &str = "5.4.11";
-
-    let tarball_path = manifest_dir.join(format!("{VERSION}.tar.gz"));
-    let vectorscan_src_dir = out_dir.join(format!("vectorscan-vectorscan-{VERSION}"));
-
-    // Note: patchfile created by diffing pristine extracted release directory tree with modified
-    // directory tree, and then running `diff -ruN PRISTINE MODIFIED >PATCHFILE`
-    let patchfile = manifest_dir.join("vectorscan.patch");
-
-    // Extract release tarball
-    {
-        match std::fs::remove_dir_all(&vectorscan_src_dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => panic!("Failed to clean Vectorscan source directory: {e}"),
-        }
-        let infile = File::open(tarball_path).expect("Failed to open Vectorscan release tarball");
-        let gz = flate2::read::GzDecoder::new(infile);
-        let mut tar = tar::Archive::new(gz);
-        // Note: unpack into `out_dir`, giving us the directory at `vectorscan_src_dir`.
-        // The downloaded tarball has `vectorscan-vectorscan-{VERSION}` as a prefix on all its entries.
-        tar.unpack(&out_dir)
-            .expect("Could not unpack Vectorscan source files");
-        eprintln!("Tarball extracted to {}", out_dir.display());
-    }
-
-    eprintln!(
-        "Vectorscan source directory is at {}",
-        vectorscan_src_dir.display()
-    );
-
-    // Patch release tarball
-    {
-        let patchfile = File::open(patchfile).expect("Failed to open patchfile");
-        let output = Command::new("patch")
-            .args(["-p1"])
-            .current_dir(&vectorscan_src_dir)
-            .stdin(patchfile)
-            .output()
-            .expect("Failed to apply patchfile");
-        assert!(output.status.success());
-        eprintln!(
-            "Successfully applied patches to Vectorscan source directory at {}",
-            vectorscan_src_dir.display()
-        );
-    }
-
     if let Some(lib_dir) = std::env::var_os("VECTORSCAN_LIB_DIR") {
         println!("cargo:rustc-link-search={}", lib_dir.display());
     } else {
-        // Build with cmake
-        let mut cfg = cmake::Config::new(&vectorscan_src_dir);
+        // In order to trick ccache into thinking the build directory is always
+        // the same, mount bind the out directory to /tmp and use that as the
+        // directory which contains the cmake build sub-directory.
+        with_optional_bind_mount(
+            &out_dir,
+            Path::new("/var"),
+            move |out_dir, bound_out_dir| {
+                let include_dir = bound_out_dir
+                    .join("include")
+                    .into_os_string()
+                    .into_string()
+                    .unwrap();
 
-        macro_rules! cfg_define_feature {
-            ($cmake_feature: tt, $cargo_feature: tt) => {
-                cfg.define(
-                    $cmake_feature,
-                    if cfg!(feature = $cargo_feature) {
-                        "ON"
+                // Choose appropriate C++ runtime library
+                {
+                    let compiler_version_out = String::from_utf8(
+                        Command::new("c++")
+                            .args(["-v"])
+                            .output()
+                            .expect("Failed to get C++ compiler version")
+                            .stderr,
+                    )
+                    .unwrap();
+
+                    if compiler_version_out.contains("gcc") {
+                        println!("cargo:rustc-link-lib=stdc++");
+                    } else if compiler_version_out.contains("clang") {
+                        println!("cargo:rustc-link-lib=c++");
                     } else {
-                        "OFF"
-                    },
-                )
-            };
-        }
-
-        let profile = {
-            // See https://doc.rust-lang.org/cargo/reference/profiles.html#opt-level for possible values
-            /*
-            match env("OPT_LEVEL").as_str() {
-                "0" => "Debug",
-                "s" | "z" => "MinSizeRel",
-                _ => "Release",
-            }
-            */
-            "Release"
-        };
-
-        cfg.profile(profile)
-            .define("CMAKE_INSTALL_INCLUDEDIR", &include_dir)
-            .define("CMAKE_VERBOSE_MAKEFILE", "ON")
-            .define("BUILD_SHARED_LIBS", "OFF")
-            .define("BUILD_STATIC_LIBS", "ON")
-            .define("WARNINGS_AS_ERRORS", "OFF")
-            .define("BUILD_EXAMPLES", "OFF")
-            .define("BUILD_BENCHMARKS", "OFF")
-            .define("BUILD_DOC", "OFF")
-            .define("BUILD_TOOLS", "OFF");
-
-        cfg_define_feature!("BUILD_UNIT", "unit_hyperscan");
-        cfg_define_feature!("USE_CPU_NAIVE", "cpu_native");
-
-        if cfg!(feature = "asan") {
-            cfg.define("SANITIZE", "address");
-        }
-
-        if cfg!(feature = "fat_runtime") {
-            cfg.define("FAT_RUNTIME", "ON");
-        } else {
-            cfg.define("FAT_RUNTIME", "OFF");
-        }
-
-        // NOTE: Several Vectorscan feature flags can be set based on available CPU SIMD features.
-        // Enabling these according to availability on the build system CPU is fragile, however:
-        // the resulting binary will not work correctly on machines with CPUs with different SIMD
-        // support.
-        //
-        // By default, we simply disable these options. However, using the `simd-specialization`
-        // feature flag, these Vectorscan features will be enabled if the build system's CPU
-        // supports them.
-        //
-        // See
-        // https://doc.rust-lang.org/reference/attributes/codegen.html#the-target_feature-attribute
-        // for supported target_feature values.
-
-        if cfg!(feature = "simd_specialization") {
-            macro_rules! x86_64_feature {
-                () => {{
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        "ON"
+                        panic!("No compatible compiler found: either clang or gcc is needed");
                     }
-                    #[cfg(not(target_arch = "x86_64"))]
-                    {
-                        "OFF"
+                }
+
+                const VERSION: &str = "5.4.11";
+
+                let tarball_path = manifest_dir.join(format!("{VERSION}.tar.gz"));
+                let vectorscan_src_dir =
+                    bound_out_dir.join(format!("vectorscan-vectorscan-{VERSION}"));
+
+                // Note: patchfile created by diffing pristine extracted release directory tree with modified
+                // directory tree, and then running `diff -ruN PRISTINE MODIFIED >PATCHFILE`
+                let patchfile = manifest_dir.join("vectorscan.patch");
+
+                // Extract release tarball
+                {
+                    match std::fs::remove_dir_all(&vectorscan_src_dir) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => panic!("Failed to clean Vectorscan source directory: {e}"),
                     }
-                }};
-            }
+                    let infile = File::open(tarball_path)
+                        .expect("Failed to open Vectorscan release tarball");
+                    let gz = flate2::read::GzDecoder::new(infile);
+                    let mut tar = tar::Archive::new(gz);
+                    // Note: unpack into `out_dir`, giving us the directory at `vectorscan_src_dir`.
+                    // The downloaded tarball has `vectorscan-vectorscan-{VERSION}` as a prefix on all its entries.
+                    tar.unpack(&bound_out_dir)
+                        .expect("Could not unpack Vectorscan source files");
+                    eprintln!("Tarball extracted to {}", bound_out_dir.display());
+                }
 
-            macro_rules! aarch64_feature {
-                () => {{
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        "ON"
+                eprintln!(
+                    "Vectorscan source directory is at {}",
+                    vectorscan_src_dir.display()
+                );
+
+                // Patch release tarball
+                {
+                    let patchfile = File::open(patchfile).expect("Failed to open patchfile");
+                    let output = Command::new("patch")
+                        .args(["-p1"])
+                        .current_dir(&vectorscan_src_dir)
+                        .stdin(patchfile)
+                        .output()
+                        .expect("Failed to apply patchfile");
+                    assert!(output.status.success());
+                    eprintln!(
+                        "Successfully applied patches to Vectorscan source directory at {}",
+                        vectorscan_src_dir.display()
+                    );
+                }
+
+                // Build with cmake
+                let mut cfg = cmake::Config::new(&vectorscan_src_dir);
+                cfg.out_dir(bound_out_dir);
+
+                macro_rules! cfg_define_feature {
+                    ($cmake_feature: tt, $cargo_feature: tt) => {
+                        cfg.define(
+                            $cmake_feature,
+                            if cfg!(feature = $cargo_feature) {
+                                "ON"
+                            } else {
+                                "OFF"
+                            },
+                        )
+                    };
+                }
+
+                let profile = {
+                    // See https://doc.rust-lang.org/cargo/reference/profiles.html#opt-level for possible values
+                    /*
+                    match env("OPT_LEVEL").as_str() {
+                        "0" => "Debug",
+                        "s" | "z" => "MinSizeRel",
+                        _ => "Release",
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        "OFF"
+                    */
+                    "Release"
+                };
+
+                cfg.profile(profile)
+                    .define("CMAKE_INSTALL_INCLUDEDIR", &include_dir)
+                    .define("CMAKE_VERBOSE_MAKEFILE", "ON")
+                    .define("BUILD_SHARED_LIBS", "OFF")
+                    .define("BUILD_STATIC_LIBS", "ON")
+                    .define("WARNINGS_AS_ERRORS", "OFF")
+                    .define("BUILD_EXAMPLES", "OFF")
+                    .define("BUILD_BENCHMARKS", "OFF")
+                    .define("BUILD_DOC", "OFF")
+                    .define("BUILD_TOOLS", "OFF");
+
+                cfg_define_feature!("BUILD_UNIT", "unit_hyperscan");
+                cfg_define_feature!("USE_CPU_NAIVE", "cpu_native");
+
+                if cfg!(feature = "asan") {
+                    cfg.define("SANITIZE", "address");
+                }
+
+                if cfg!(feature = "fat_runtime") {
+                    cfg.define("FAT_RUNTIME", "ON");
+                } else {
+                    cfg.define("FAT_RUNTIME", "OFF");
+                }
+
+                // NOTE: Several Vectorscan feature flags can be set based on available CPU SIMD features.
+                // Enabling these according to availability on the build system CPU is fragile, however:
+                // the resulting binary will not work correctly on machines with CPUs with different SIMD
+                // support.
+                //
+                // By default, we simply disable these options. However, using the `simd-specialization`
+                // feature flag, these Vectorscan features will be enabled if the build system's CPU
+                // supports them.
+                //
+                // See
+                // https://doc.rust-lang.org/reference/attributes/codegen.html#the-target_feature-attribute
+                // for supported target_feature values.
+
+                if cfg!(feature = "simd_specialization") {
+                    macro_rules! x86_64_feature {
+                        () => {{
+                            #[cfg(target_arch = "x86_64")]
+                            {
+                                "ON"
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            {
+                                "OFF"
+                            }
+                        }};
                     }
-                }};
-            }
 
-            cfg.define("BUILD_AVX2", x86_64_feature!());
-            // XXX use avx512vbmi as a proxy for this, as it's not clear which particular avx512
-            // instructions are needed
-            cfg.define("BUILD_AVX512", x86_64_feature!());
-            cfg.define("BUILD_AVX512VBMI", x86_64_feature!());
+                    macro_rules! aarch64_feature {
+                        () => {{
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                "ON"
+                            }
+                            #[cfg(not(target_arch = "aarch64"))]
+                            {
+                                "OFF"
+                            }
+                        }};
+                    }
 
-            cfg.define("BUILD_SVE", aarch64_feature!());
-            cfg.define("BUILD_SVE2", aarch64_feature!());
-            cfg.define("BUILD_SVE2_BITPERM", aarch64_feature!());
-        } else {
-            cfg.define("BUILD_AVX2", "OFF")
-                .define("BUILD_AVX512", "OFF")
-                .define("BUILD_AVX512VBMI", "OFF")
-                .define("BUILD_SVE", "OFF")
-                .define("BUILD_SVE2", "OFF")
-                .define("BUILD_SVE2_BITPERM", "OFF");
-        }
+                    cfg.define("BUILD_AVX2", x86_64_feature!());
+                    // XXX use avx512vbmi as a proxy for this, as it's not clear which particular avx512
+                    // instructions are needed
+                    cfg.define("BUILD_AVX512", x86_64_feature!());
+                    cfg.define("BUILD_AVX512VBMI", x86_64_feature!());
 
-        let dst = cfg.build();
-        rename_library(&dst);
+                    cfg.define("BUILD_SVE", aarch64_feature!());
+                    cfg.define("BUILD_SVE2", aarch64_feature!());
+                    cfg.define("BUILD_SVE2_BITPERM", aarch64_feature!());
+                } else {
+                    cfg.define("BUILD_AVX2", "OFF")
+                        .define("BUILD_AVX512", "OFF")
+                        .define("BUILD_AVX512VBMI", "OFF")
+                        .define("BUILD_SVE", "OFF")
+                        .define("BUILD_SVE2", "OFF")
+                        .define("BUILD_SVE2_BITPERM", "OFF");
+                }
 
-        println!("cargo:rustc-link-search={}", dst.join("lib").display());
-        println!("cargo:rustc-link-search={}", dst.join("lib64").display());
+                cfg.build();
+                rename_library(&out_dir);
+
+                println!("cargo:rustc-link-search={}", out_dir.join("lib").display());
+                println!(
+                    "cargo:rustc-link-search={}",
+                    out_dir.join("lib64").display()
+                );
+            },
+        );
     }
 
     println!("cargo:rustc-link-lib=static=vs");
