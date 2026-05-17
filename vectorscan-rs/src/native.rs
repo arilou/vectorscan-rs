@@ -148,6 +148,16 @@ impl StreamingDatabase {
     pub fn stream_size(&self) -> Result<usize, Error> {
         self.inner.stream_size()
     }
+
+    /// Deserialize a streaming database from bytes produced by `hs_serialize_database`.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, Error> {
+        let inner = wrapper::Database::try_from(bytes)?;
+        Ok(Self { inner })
+    }
+
+    pub fn as_ptr(&self) -> *const hs::hs_database_t {
+        self.inner.as_ptr()
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
